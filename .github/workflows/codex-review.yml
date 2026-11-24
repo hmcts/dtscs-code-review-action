@@ -1,0 +1,211 @@
+name: Codex PR review
+
+on:
+  workflow_call:
+    inputs:
+      target_branch:
+        type: string
+        required: true
+    secrets:
+      OPENAI_API_KEY:
+        required: true
+
+env:
+  REVIEW_TARGET_BRANCH: ${{ inputs.target_branch }}
+
+permissions: {}
+
+jobs:
+  authorize:
+    if: >-
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, '/review') && github.event.comment.user.type == 'User' &&
+      contains(fromJSON('["COLLABORATOR","MEMBER","OWNER"]'), github.event.comment.author_association)) ||
+      (github.event_name == 'pull_request_target' && !github.event.pull_request.draft &&
+      github.event.pull_request.head.repo.id == github.event.repository.id && github.event.sender.type == 'User')
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+    outputs:
+      base_tip: ${{ steps.request.outputs.base_tip }}
+      head: ${{ steps.request.outputs.head }}
+      merge_base: ${{ steps.request.outputs.merge_base }}
+      focus: ${{ steps.request.outputs.focus }}
+      focus_hash: ${{ steps.request.outputs.focus_hash }}
+      review_key: ${{ steps.request.outputs.review_key }}
+      superseded_automatic: ${{ steps.replacement.outputs.runs }}
+      request_marker: ${{ steps.register_request.outputs.artifact-id }}
+      confirmed_review: ${{ steps.confirmed_review.outputs.url }}
+    steps:
+      - name: Load shared review tools
+        uses: $/actions/review-tools
+
+      - name: Authorize request and resolve PR revision
+        id: request
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const authorizeReview = require(`${process.env.CODEX_REVIEW_TOOLS}/authorize-review.cjs`);
+            const request = await authorizeReview({ github, context, core, targetBranch: process.env.REVIEW_TARGET_BRANCH });
+            if (!request) return;
+            for (const [key, value] of Object.entries(request)) core.setOutput(key, value);
+
+      - name: Find a superseded automatic review
+        id: replacement
+        if: github.run_attempt == '1' && github.event.action == 'synchronize' && steps.request.outputs.review_key != ''
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          BASE_TIP_SHA: ${{ steps.request.outputs.base_tip }}
+          HEAD_SHA: ${{ steps.request.outputs.head }}
+          MERGE_BASE_SHA: ${{ steps.request.outputs.merge_base }}
+        with:
+          script: |
+            const { findSupersededAutomaticReviews } = require(`${process.env.CODEX_REVIEW_TOOLS}/review-request.cjs`);
+            const runs = await findSupersededAutomaticReviews({ github, context, env: process.env });
+            if (runs.length > 0) core.setOutput('runs', JSON.stringify(runs));
+
+      # Register before queueing and before cancelling any predecessor.
+      - name: Write review request marker
+        id: review_request
+        if: >-
+          github.run_attempt == '1' && steps.request.outputs.review_key != '' &&
+          (github.event.action != 'synchronize' || steps.replacement.outputs.runs != '')
+        continue-on-error: ${{ github.event.action != 'synchronize' }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          HEAD_SHA: ${{ steps.request.outputs.head }}
+          MERGE_BASE_SHA: ${{ steps.request.outputs.merge_base }}
+          REVIEW_FOCUS_HASH: ${{ steps.request.outputs.focus_hash }}
+          REVIEW_REQUEST_FILE: ${{ runner.temp }}/codex-review-request.txt
+        with:
+          script: |
+            const { writeFileSync } = require('node:fs');
+            const { reviewRequestArtifactName } = require(`${process.env.CODEX_REVIEW_TOOLS}/review-request.cjs`);
+            const name = reviewRequestArtifactName(context, process.env);
+            writeFileSync(process.env.REVIEW_REQUEST_FILE, name + '\n');
+            core.setOutput('artifact_name', name);
+
+      - name: Register review request
+        id: register_request
+        if: steps.review_request.outputs.artifact_name != ''
+        continue-on-error: ${{ github.event.action != 'synchronize' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.review_request.outputs.artifact_name }}
+          path: ${{ runner.temp }}/codex-review-request.txt
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Check for an already published automatic review
+        id: confirmed_review
+        if: >-
+          github.event_name == 'pull_request_target' && steps.request.outputs.review_key != '' &&
+          (github.event.action != 'synchronize' || steps.register_request.outputs.artifact-id != '')
+        continue-on-error: true
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          REVIEW_KEY: ${{ steps.request.outputs.review_key }}
+        with:
+          script: |
+            const { findingsArtifactName } = require(`${process.env.CODEX_REVIEW_TOOLS}/review-artifacts.cjs`);
+            const resolveExistingReview = require(`${process.env.CODEX_REVIEW_TOOLS}/reuse-review.cjs`);
+            const result = await resolveExistingReview({ github, context, artifactName: findingsArtifactName(process.env.REVIEW_KEY) });
+            if (result?.mode === 'covered') core.setOutput('url', result.url);
+
+  acknowledge:
+    needs: authorize
+    if: github.event_name == 'issue_comment' && needs.authorize.outputs.review_key != ''
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - name: React to the accepted review comment
+        continue-on-error: true
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            await github.rest.reactions.createForIssueComment({
+              ...context.repo,
+              comment_id: context.payload.comment.id,
+              content: 'eyes',
+            });
+
+      - name: Load shared review tools
+        if: github.run_attempt == '1'
+        uses: $/actions/review-tools
+
+      - name: Cancel superseded manual reviews with the same focus
+        if: github.run_attempt == '1'
+        continue-on-error: true
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          BASE_TIP_SHA: ${{ needs.authorize.outputs.base_tip }}
+          HEAD_SHA: ${{ needs.authorize.outputs.head }}
+          MERGE_BASE_SHA: ${{ needs.authorize.outputs.merge_base }}
+          REVIEW_FOCUS_HASH: ${{ needs.authorize.outputs.focus_hash }}
+        with:
+          script: |
+            const { cancelSupersededManualReviews } = require(`${process.env.CODEX_REVIEW_TOOLS}/review-request.cjs`);
+            await cancelSupersededManualReviews({ github, context, core, env: process.env });
+
+  cancel_automatic:
+    needs: authorize
+    if: >-
+      github.run_attempt == '1' && needs.authorize.outputs.superseded_automatic != '' &&
+      needs.authorize.outputs.request_marker != ''
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Load shared review tools
+        uses: $/actions/review-tools
+
+      - name: Cancel superseded automatic reviews for the same PR
+        continue-on-error: true
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          BASE_TIP_SHA: ${{ needs.authorize.outputs.base_tip }}
+          HEAD_SHA: ${{ needs.authorize.outputs.head }}
+          MERGE_BASE_SHA: ${{ needs.authorize.outputs.merge_base }}
+          SUPERSEDED_RUNS: ${{ needs.authorize.outputs.superseded_automatic }}
+        with:
+          script: |
+            const runs = JSON.parse(process.env.SUPERSEDED_RUNS);
+            const { cancelSupersededAutomaticReviews } = require(`${process.env.CODEX_REVIEW_TOOLS}/review-request.cjs`);
+            await cancelSupersededAutomaticReviews({ github, context, core, env: process.env, runs });
+
+  run_review:
+    needs: [authorize, cancel_automatic]
+    if: >-
+      !cancelled() && needs.authorize.result == 'success' && needs.authorize.outputs.review_key != '' &&
+      (github.event.action != 'synchronize' || needs.authorize.outputs.request_marker != '')
+    # Share the slot with generation jobs from the old workflow.
+    concurrency:
+      group: >-
+        ${{ needs.authorize.outputs.confirmed_review != '' && format('codex-review-covered-{0}', github.run_id) ||
+        format('codex-review-{0}', needs.authorize.outputs.review_key) }}
+      queue: max
+    permissions:
+      actions: read
+      checks: write
+      contents: read
+      pull-requests: write
+    uses: ./.github/workflows/codex-review-run.yml
+    secrets:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+    with:
+      target_branch: ${{ inputs.target_branch }}
+      base_tip: ${{ needs.authorize.outputs.base_tip }}
+      head: ${{ needs.authorize.outputs.head }}
+      merge_base: ${{ needs.authorize.outputs.merge_base }}
+      focus: ${{ needs.authorize.outputs.focus }}
+      focus_hash: ${{ needs.authorize.outputs.focus_hash }}
+      review_key: ${{ needs.authorize.outputs.review_key }}
+      confirmed_review: ${{ needs.authorize.outputs.confirmed_review }}

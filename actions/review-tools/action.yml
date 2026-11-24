@@ -1,0 +1,10 @@
+name: Load Codex review tools
+description: Make the pinned shared review helpers and schema available to later steps.
+runs:
+  using: composite
+  steps:
+    - name: Set the shared review tools directory
+      shell: bash
+      env:
+        REVIEW_ACTION_PATH: ${{ github.action_path }}
+      run: printf 'CODEX_REVIEW_TOOLS=%s\n' "$REVIEW_ACTION_PATH" >> "$GITHUB_ENV"

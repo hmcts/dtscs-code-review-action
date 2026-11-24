@@ -1,0 +1,352 @@
+name: Run and publish Codex review
+
+on:
+  workflow_call:
+    inputs:
+      target_branch:
+        type: string
+        required: true
+      base_tip:
+        type: string
+        required: true
+      head:
+        type: string
+        required: true
+      merge_base:
+        type: string
+        required: true
+      focus:
+        type: string
+        required: true
+      focus_hash:
+        type: string
+        required: true
+      review_key:
+        type: string
+        required: true
+      confirmed_review:
+        type: string
+    secrets:
+      OPENAI_API_KEY:
+        required: true
+
+permissions: {}
+
+env:
+  REVIEW_TARGET_BRANCH: ${{ inputs.target_branch }}
+  BASE_TIP_SHA: ${{ inputs.base_tip }}
+  HEAD_SHA: ${{ inputs.head }}
+  MERGE_BASE_SHA: ${{ inputs.merge_base }}
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: code-review
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+    env:
+      REVIEW_CODEX_MODEL: gpt-6.2-sol
+      REVIEW_CODEX_EFFORT: medium
+    outputs:
+      findings_artifact_id: ${{ steps.upload_findings.outputs.artifact-id }}
+      mode: ${{ steps.before_codex.outputs.mode || steps.existing_review.outputs.mode }}
+    steps:
+      - name: Load shared review tools
+        uses: $/actions/review-tools
+
+      # The checkout contains trusted instructions. PR files are read from Git objects.
+      - name: Check out default branch and fetch history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve the existing review outcome
+        id: existing_review
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          CONFIRMED_REVIEW_URL: ${{ inputs.confirmed_review }}
+          REVIEW_KEY: ${{ inputs.review_key }}
+        with:
+          script: |
+            const getReviewedPullRequest = require(`${process.env.CODEX_REVIEW_TOOLS}/review-revision.cjs`);
+            const pr = await getReviewedPullRequest({ github, context, env: process.env });
+            if (pr === null) {
+              core.notice('The PR changed or closed before the review started.');
+              core.setOutput('mode', 'stale');
+              return;
+            }
+            const { findingsArtifactName } = require(`${process.env.CODEX_REVIEW_TOOLS}/review-artifacts.cjs`);
+            const resolveExistingReview = require(`${process.env.CODEX_REVIEW_TOOLS}/reuse-review.cjs`);
+            const artifactName = findingsArtifactName(process.env.REVIEW_KEY);
+            core.setOutput('artifact_name', artifactName);
+            core.setOutput('base_tip', pr.base.sha);
+            const confirmedUrl = process.env.CONFIRMED_REVIEW_URL;
+            const result = confirmedUrl
+              ? { mode: 'covered', url: confirmedUrl }
+              : await resolveExistingReview({ github, context, artifactName });
+            core.setOutput('mode', result?.mode ?? 'generate');
+            if (result?.mode === 'covered') {
+              core.notice(`This request is covered by an existing Codex review: ${result.url}`);
+            } else if (result?.mode === 'retry') {
+              core.notice(`Retrying publication with the findings from ${result.url}`);
+              core.setOutput('retry_run_id', result.runId);
+              core.setOutput('retry_artifact_id', result.artifactId);
+            }
+
+      - name: Check OpenAI API key configuration
+        if: steps.existing_review.outputs.mode == 'generate'
+        env:
+          REVIEW_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [[ -z "$REVIEW_API_KEY" ]]; then
+            echo '::error::Set OPENAI_API_KEY in the code-review environment.'
+            exit 1
+          fi
+
+      - name: Prepare review files
+        if: steps.existing_review.outputs.mode == 'generate'
+        run: |
+          git cat-file -e "$MERGE_BASE_SHA^{commit}"
+          git cat-file -e "$HEAD_SHA^{commit}"
+          mkdir -p -m 700 "$RUNNER_TEMP/codex-review-home"
+          printf '%s-%s\n' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" > "$RUNNER_TEMP/codex-review-publication-id.txt"
+
+      - name: Prepare dependency context and install inputs
+        id: dependency_inputs
+        if: steps.existing_review.outputs.mode == 'generate'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          REVIEW_DEPENDENCY_CONTEXT_FILE: ${{ runner.temp }}/codex-review-dependency-context.md
+        with:
+          script: |
+            const { writeFileSync } = require('node:fs');
+            const prepareReviewDependencies = require(`${process.env.CODEX_REVIEW_TOOLS}/prepare-review-dependencies.cjs`);
+            const { upstreamContext = '', installDirectory } = prepareReviewDependencies({
+              base: process.env.MERGE_BASE_SHA,
+              head: process.env.HEAD_SHA,
+              tempDir: process.env.RUNNER_TEMP,
+              workspace: process.env.GITHUB_WORKSPACE,
+              warn: core.warning,
+            });
+            writeFileSync(process.env.REVIEW_DEPENDENCY_CONTEXT_FILE, upstreamContext);
+            if (installDirectory) core.setOutput('directory', installDirectory);
+
+      - name: Set up Node.js for Yarn
+        id: setup_node_for_yarn
+        if: steps.dependency_inputs.outputs.directory != ''
+        continue-on-error: true
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+
+      - name: Install review dependencies
+        id: install_dependencies
+        if: steps.setup_node_for_yarn.outcome == 'success'
+        working-directory: ${{ steps.dependency_inputs.outputs.directory }}
+        continue-on-error: true
+        timeout-minutes: 4
+        shell: bash
+        env:
+          YARN_IGNORE_PATH: '1'
+        # Strip GitHub workflow command delimiters from PR-influenced diagnostics.
+        run: ../yarn install --immutable --mode=skip-build 2>&1 | tr ':#' '  '
+
+      - name: Confirm the PR revision and write the review prompt
+        if: steps.existing_review.outputs.mode == 'generate'
+        id: before_codex
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          VERIFIED_BASE_TIP_SHA: ${{ steps.existing_review.outputs.base_tip }}
+          REVIEW_PROMPT_FILE: ${{ runner.temp }}/codex-review.md
+          REVIEW_FOCUS: ${{ inputs.focus }}
+          REVIEW_FOCUS_HASH: ${{ inputs.focus_hash }}
+          REVIEW_DEPENDENCY_CONTEXT_FILE: ${{ runner.temp }}/codex-review-dependency-context.md
+          REVIEW_DEPENDENCY_DIRECTORY: ${{ steps.install_dependencies.outcome == 'success' && steps.dependency_inputs.outputs.directory || '' }}
+          REVIEW_DEPENDENCY_SETUP_FAILED: ${{ steps.setup_node_for_yarn.outcome == 'failure' || steps.install_dependencies.outcome == 'failure' }}
+        with:
+          script: |
+            const getReviewedPullRequest = require(`${process.env.CODEX_REVIEW_TOOLS}/review-revision.cjs`);
+            const pr = await getReviewedPullRequest({ github, context, env: process.env, knownBaseTip: process.env.VERIFIED_BASE_TIP_SHA });
+            if (pr === null) {
+              core.notice('The PR changed or closed before the review started.');
+              core.setOutput('mode', 'stale');
+              return;
+            }
+            const writeReviewPrompt = require(`${process.env.CODEX_REVIEW_TOOLS}/review-prompt.cjs`);
+            writeReviewPrompt({ pr, env: process.env, warn: core.warning });
+            core.setOutput('mode', 'generate');
+            core.setOutput('codex_started_at_ms', Date.now());
+
+      - name: Review PR with Codex
+        id: codex
+        if: steps.before_codex.outputs.mode == 'generate'
+        uses: openai/codex-action@306c6a196a99dcc6582530c396a19d2672d5e9ec # v1.14
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          responses-api-endpoint: https://eu.api.openai.com/v1/responses
+          codex-version: '0.171.0'
+          model: ${{ env.REVIEW_CODEX_MODEL }}
+          effort: ${{ env.REVIEW_CODEX_EFFORT }}
+          codex-home: ${{ runner.temp }}/codex-review-home
+          prompt-file: ${{ runner.temp }}/codex-review.md
+          output-schema-file: ${{ env.CODEX_REVIEW_TOOLS }}/review.schema.json
+          output-file: ${{ runner.temp }}/codex-review-findings.json
+          permission-profile: ':read-only'
+          safety-strategy: drop-sudo
+
+      - name: Record Codex completion time
+        id: codex_timing
+        if: >-
+          ${{ always() &&
+          steps.before_codex.outputs.codex_started_at_ms != '' && steps.codex.outcome != 'skipped' }}
+        continue-on-error: true
+        run: printf 'finished_at_ms=%s\n' "$(node -p 'Date.now()')" >> "$GITHUB_OUTPUT"
+
+      - name: Download findings for publication retry
+        if: steps.existing_review.outputs.mode == 'retry'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.existing_review.outputs.retry_run_id }}
+          artifact-ids: ${{ steps.existing_review.outputs.retry_artifact_id }}
+          path: ${{ runner.temp }}
+
+      - name: Upload review findings
+        if: steps.before_codex.outputs.mode == 'generate' || steps.existing_review.outputs.mode == 'retry'
+        id: upload_findings
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.existing_review.outputs.artifact_name }}
+          path: |
+            ${{ runner.temp }}/codex-review-findings.json
+            ${{ runner.temp }}/codex-review-publication-id.txt
+          if-no-files-found: error
+          overwrite: true
+
+      - name: Record review stats
+        id: usage
+        if: ${{ !cancelled() || steps.before_codex.outputs.codex_started_at_ms != '' }}
+        continue-on-error: true
+        env:
+          REVIEW_CODEX_HOME: ${{ runner.temp }}/codex-review-home
+          REVIEW_PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+          REVIEW_TRIGGER: ${{ github.event_name == 'pull_request_target' && 'automatic' || (inputs.focus_hash != '' && 'focused') || 'manual' }}
+          REVIEW_MODE: ${{ steps.before_codex.outputs.mode || steps.existing_review.outputs.mode }}
+          REVIEW_CANCELLED: ${{ job.status == 'cancelled' }}
+          CODEX_OUTCOME: ${{ steps.codex.outcome }}
+          REVIEW_CODEX_STARTED_AT_MS: ${{ steps.before_codex.outputs.codex_started_at_ms }}
+          REVIEW_CODEX_FINISHED_AT_MS: ${{ steps.codex_timing.outputs.finished_at_ms }}
+          REVIEW_OUTPUT_FILE: ${{ runner.temp }}/codex-review-findings.json
+          REVIEW_PUBLICATION_ID_FILE: ${{ runner.temp }}/codex-review-publication-id.txt
+        run: node "$CODEX_REVIEW_TOOLS/review-usage.cjs"
+
+      - name: Mark late cancellation in review stats
+        if: ${{ cancelled() && steps.usage.outcome == 'success' }}
+        continue-on-error: true
+        run: node -e 'require(process.env.CODEX_REVIEW_TOOLS + "/review-usage.cjs").markReviewStatsCancelled()'
+
+      - name: Upload review stats
+        if: ${{ always() && steps.usage.outcome == 'success' }}
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: codex-review-stats-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/review-stats.json
+          if-no-files-found: error
+
+  publish:
+    needs: review
+    if: >-
+      !cancelled() && needs.review.result == 'success' &&
+      needs.review.outputs.findings_artifact_id != ''
+    runs-on: ubuntu-latest
+    # An old run can retry these findings even if this job was originally queued to publish a fresh review.
+    concurrency:
+      group: codex-review-publish-${{ inputs.review_key }}
+      queue: max
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: write
+    outputs:
+      outcome: ${{ steps.publish_review.outputs.outcome }}
+    steps:
+      - name: Load shared review tools
+        uses: $/actions/review-tools
+
+      - name: Download review findings
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          # Publisher-only reruns can need an artifact from an earlier attempt.
+          github-token: ${{ github.token }}
+          run-id: ${{ github.run_id }}
+          artifact-ids: ${{ needs.review.outputs.findings_artifact_id }}
+          path: ${{ runner.temp }}/codex-review
+
+      - name: Publish valid review findings
+        id: publish_review
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          REVIEW_FOCUS: ${{ inputs.focus }}
+          REVIEW_FOCUS_HASH: ${{ inputs.focus_hash }}
+          REVIEW_OUTPUT_FILE: ${{ runner.temp }}/codex-review/codex-review-findings.json
+          REVIEW_PUBLICATION_ID_FILE: ${{ runner.temp }}/codex-review/codex-review-publication-id.txt
+          REVIEW_FINDINGS_ARTIFACT_ID: ${{ needs.review.outputs.findings_artifact_id }}
+          REVIEW_PUBLICATION_OUTCOME_FILE: ${{ runner.temp }}/codex-review-publication.json
+        with:
+          script: |
+            const { writeFileSync } = require('node:fs');
+            const publish = require(`${process.env.CODEX_REVIEW_TOOLS}/publish-review.cjs`);
+            const artifactId = process.env.REVIEW_FINDINGS_ARTIFACT_ID;
+            const result = await publish({ github, context, core, env: process.env });
+            const { publicationReceiptName } = require(`${process.env.CODEX_REVIEW_TOOLS}/review-artifacts.cjs`);
+            core.setOutput('outcome', result.outcome);
+            writeFileSync(process.env.REVIEW_PUBLICATION_OUTCOME_FILE, JSON.stringify({ artifactId, ...result }));
+            core.setOutput('receipt_name', publicationReceiptName(artifactId, process.env.GITHUB_RUN_ATTEMPT, result));
+
+      - name: Upload review publication outcome
+        if: steps.publish_review.outputs.receipt_name != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.publish_review.outputs.receipt_name }}
+          path: ${{ runner.temp }}/codex-review-publication.json
+          if-no-files-found: error
+
+  report:
+    needs: [review, publish]
+    if: ${{ !cancelled() && needs.review.result != 'skipped' && needs.review.outputs.mode != 'covered' }}
+    runs-on: ubuntu-latest
+    permissions:
+      checks: write
+    steps:
+      - name: Report the advisory Codex review check
+        continue-on-error: true
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          REVIEW_MODE: ${{ needs.review.outputs.mode }}
+          REVIEW_RESULT: ${{ needs.review.result }}
+          PUBLISH_OUTCOME: ${{ needs.publish.outputs.outcome }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const fallback = process.env.REVIEW_RESULT === 'success' ? 'Review publication did not complete' : 'Review did not complete';
+            const title = process.env.REVIEW_MODE === 'stale' ? 'PR changed before review' : (process.env.PUBLISH_OUTCOME || fallback);
+            await github.rest.checks.create({
+              ...context.repo,
+              name: 'Codex review',
+              head_sha: process.env.HEAD_SHA,
+              status: 'completed',
+              conclusion: 'neutral',
+              details_url: runUrl,
+              output: {
+                title,
+                summary: `Pull request #${context.issue.number}. [View the Actions run](${runUrl}).`,
+              },
+            });
