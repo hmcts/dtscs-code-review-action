@@ -33,13 +33,8 @@ to the caller's `code-review` environment and runs Codex read-only.
 
 Save this as `.github/workflows/codex-review.yml` in the calling repository.
 Replace `master` in both places if the caller uses a different default branch.
-Replace `RELEASE_SHA` with the full commit SHA of the
-[`v1.0.0` tag](https://github.com/hmcts/dtscs-code-review-action/tree/v1.0.0).
-For a later release, update the SHA and the version comment together.
-
-```bash
-git ls-remote https://github.com/hmcts/dtscs-code-review-action.git 'refs/tags/v1.0.0^{}'
-```
+Pin the workflow to the full commit SHA of the release you want to use.
+When upgrading, update the SHA and the version comment together.
 
 ```yaml
 name: Codex PR review
@@ -61,7 +56,7 @@ jobs:
       contents: read
       issues: write
       pull-requests: write
-    uses: hmcts/dtscs-code-review-action/.github/workflows/codex-review.yml@RELEASE_SHA # v1.0.0
+    uses: hmcts/dtscs-code-review-action/.github/workflows/codex-review.yml@a04090836f7408791b0479abbd8c83604c7bfa37 # v1.0.0
     with:
       target_branch: master
     secrets:
